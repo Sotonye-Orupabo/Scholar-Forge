@@ -1,0 +1,166 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  Draft, Hit, Route, Tier, acceptBlock, draftBlock, getDisclosure, health, ingestFolder,
+  rejectBlock, routeTask, searchSources,
+} from "./api";
+
+export default function App() {
+  const [online, setOnline] = useState(navigator.onLine);
+  const [tier, setTier] = useState<Tier>("draft");
+  const [route, setRoute] = useState<Route | null>(null);
+  const [connected, setConnected] = useState<boolean | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const [folder, setFolder] = useState("");
+  const [ingestNote, setIngestNote] = useState("");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<Hit[] | null>(null);
+
+  const [section, setSection] = useState("");
+  const [instruction, setInstruction] = useState("");
+  const [current, setCurrent] = useState<Draft | null>(null);
+  const [editText, setEditText] = useState("");
+  const [feedback, setFeedback] = useState("");
+  const [accepted, setAccepted] = useState<string[]>([]);
+  const [disclosure, setDisclosure] = useState("");
+
+  const guard = useCallback(async (fn: () => Promise<void>) => {
+    setBusy(true); setError("");
+    try { await fn(); } catch (e) { setError(e instanceof Error ? e.message : String(e)); }
+    finally { setBusy(false); }
+  }, []);
+
+  useEffect(() => {
+    const on = () => setOnline(true), off = () => setOnline(false);
+    window.addEventListener("online", on); window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
+  }, []);
+  useEffect(() => { health().then(() => setConnected(true)).catch((e) => { setConnected(false); setError(String(e.message ?? e)); }); }, []);
+  useEffect(() => { if (connected) routeTask(tier, online).then(setRoute).catch(() => setRoute(null)); }, [tier, online, connected]);
+
+  const addSources = () => guard(async () => {
+    const { results } = await ingestFolder(folder.trim());
+    const n = Object.keys(results).length;
+    setIngestNote(`${n} file${n === 1 ? "" : "s"} processed.`);
+  });
+  const search = () => guard(async () => setHits(await searchSources(query.trim())));
+
+  const generate = (withFeedback: string) => guard(async () => {
+    if (current) await rejectBlock(current.event_id);
+    const d = await draftBlock({ section: section.trim(), instruction: instruction.trim(), tier, online, feedback: withFeedback });
+    setCurrent(d); setEditText(d.text); setFeedback("");
+  });
+  const accept = () => guard(async () => {
+    if (!current) return;
+    const r = await acceptBlock(current.event_id, editText);
+    setAccepted((a) => [...a, r.final_text]); setCurrent(null); setEditText("");
+    setDisclosure("");
+  });
+  const discard = () => guard(async () => {
+    if (current) await rejectBlock(current.event_id);
+    setCurrent(null); setEditText("");
+  });
+  const showDisclosure = () => guard(async () => setDisclosure(await getDisclosure()));
+
+  const canDraft = connected === true && section.trim() !== "" && instruction.trim() !== "" && !busy;
+
+  return (
+    <div className="shell">
+      <aside className="sources" aria-label="Sources">
+        <h2>Sources</h2>
+        <label>
+          Folder of PDFs or text files
+          <input value={folder} onChange={(e) => setFolder(e.target.value)} placeholder="/path/to/papers" />
+        </label>
+        <button onClick={addSources} disabled={!folder.trim() || busy || !connected}>Add sources</button>
+        {ingestNote && <p className="note">{ingestNote}</p>}
+        <label className="gap">
+          Search your library
+          <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="e.g. sleep and memory"
+                 onKeyDown={(e) => e.key === "Enter" && query.trim() && search()} />
+        </label>
+        <button onClick={search} disabled={!query.trim() || busy || !connected}>Search</button>
+        <ul>
+          {hits?.map((h, i) => (
+            <li key={i}>
+              <cite>{h.csl_id}, p. {h.page}</cite>
+              <span className="section">{h.section}</span>
+              <p>{h.text}</p>
+            </li>
+          ))}
+        </ul>
+        {hits === null && <p className="empty">Add a folder, then search to pull passages with page numbers.</p>}
+        {hits?.length === 0 && <p className="empty">No passages matched. Try different words.</p>}
+      </aside>
+
+      <main className="draft" aria-label="Draft">
+        <header>
+          <div className="segmented" role="group" aria-label="Task tier">
+            {(["draft", "submission"] as const).map((t) => (
+              <button key={t} aria-pressed={tier === t} onClick={() => setTier(t)}>
+                {t === "draft" ? "Draft" : "Submission-ready"}
+              </button>
+            ))}
+          </div>
+          <p className="route">
+            {online ? "Online" : "Offline"}. Runs on {route?.target ?? "..."}. Output labelled <mark>{route?.label ?? "..."}</mark>.
+          </p>
+        </header>
+
+        {connected === false && (
+          <p className="problem" role="alert">The writing service is not running. {error}</p>
+        )}
+        {connected !== false && error && <p className="problem" role="alert">{error}</p>}
+
+        <div className="compose">
+          <label>Section<input value={section} onChange={(e) => setSection(e.target.value)} placeholder="e.g. 3.2 Results" /></label>
+          <label>What should this block do?
+            <textarea rows={3} value={instruction} onChange={(e) => setInstruction(e.target.value)}
+                      placeholder="e.g. Compare how the sources measure recall" />
+          </label>
+          <button onClick={() => generate("")} disabled={!canDraft || current !== null}>
+            {busy && !current ? "Drafting..." : "Draft block"}
+          </button>
+        </div>
+
+        {current && (
+          <article className="pending" aria-label="Block awaiting your decision">
+            <p className="meta">
+              <mark>{current.route_label}</mark> from {current.provider}
+              {current.fell_back && " (cloud unavailable, used the local model)"}
+              {current.withheld_local_only > 0 && `. ${current.withheld_local_only} local-only source(s) not sent.`}
+            </p>
+            <textarea className="editor" rows={10} value={editText} onChange={(e) => setEditText(e.target.value)} aria-label="Edit block" />
+            <div className="actions">
+              <button onClick={accept} disabled={busy || !editText.trim()}>
+                {current.findings.length ? `Accept with ${current.findings.length} open issue${current.findings.length === 1 ? "" : "s"}` : "Accept block"}
+              </button>
+              <input className="fb" value={feedback} onChange={(e) => setFeedback(e.target.value)} placeholder="What should change?" aria-label="Feedback for regeneration" />
+              <button className="quiet" onClick={() => generate(feedback)} disabled={busy}>Regenerate</button>
+              <button className="quiet" onClick={discard} disabled={busy}>Discard</button>
+            </div>
+          </article>
+        )}
+
+        {accepted.map((t, i) => <article key={i} className="accepted"><p>{t}</p></article>)}
+        {accepted.length === 0 && !current && (
+          <p className="empty">Accepted blocks collect here. Each block waits for your decision before the next one.</p>
+        )}
+        {accepted.length > 0 && (
+          <div className="actions"><button className="quiet" onClick={showDisclosure} disabled={busy}>Show AI disclosure</button></div>
+        )}
+        {disclosure && <pre className="disclosure">{disclosure}</pre>}
+      </main>
+
+      <aside className="integrity" aria-label="Integrity checks">
+        <h2>Integrity</h2>
+        {!current && <p className="empty">Checks run on each drafted block: copied wording, unsupported numbers, citations, and style.</p>}
+        {current && current.findings.length === 0 && <p className="ok">No problems found in this block.</p>}
+        {current && current.findings.length > 0 && (
+          <ul className="checks">{current.findings.map((f, i) => <li key={i}>{f}</li>)}</ul>
+        )}
+      </aside>
+    </div>
+  );
+}
